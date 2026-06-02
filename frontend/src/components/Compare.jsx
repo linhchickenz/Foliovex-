@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { fmtPct, fmtSharpe, fmtNum } from '../utils/format'
+import { API_BASE_URL } from '../utils/api'
 
 // 3 distinct colors that read well on light + dark surfaces.
 const COLORS = ['#6366f1', '#10b981', '#f59e0b']
@@ -100,7 +101,7 @@ export default function Compare({ saved }) {
         return
       }
       try {
-        const res = await fetch('/api/analyze', {
+        const res = await fetch(`${API_BASE_URL}/api/analyze`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

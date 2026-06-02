@@ -11,6 +11,7 @@ import Sidebar from './components/Sidebar'
 import Methodology from './components/Methodology'
 import Compare from './components/Compare'
 import { fmtCurrency } from './utils/format'
+import { API_BASE_URL } from './utils/api'
 
 const SIDEBAR_KEY = 'portfolio-sidebar-collapsed'
 const TAB_KEY = 'portfolio-active-tab'
@@ -182,7 +183,7 @@ export default function App() {
   useEffect(() => {
     let cancelled = false
     setLiveRiskFreeRateLoading(true)
-    fetch(`/api/risk-free?currency=${currency}`)
+    fetch(`${API_BASE_URL}/api/risk-free?currency=${currency}`)
       .then(r => r.ok ? r.json() : Promise.reject(r))
       .then(data => {
         if (!cancelled && typeof data.rate === 'number') {
@@ -255,7 +256,7 @@ export default function App() {
       : (BENCHMARK_TICKERS[benchmark] || null)
 
     try {
-      const res = await fetch('/api/analyze', {
+      const res = await fetch(`${API_BASE_URL}/api/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -308,7 +309,7 @@ export default function App() {
     const compareTicker = compare && compare !== 'none' ? MC_COMPARE_TICKERS[compare] : null
     setMcLoading(true)
     try {
-      const mcRes = await fetch('/api/monte-carlo', {
+      const mcRes = await fetch(`${API_BASE_URL}/api/monte-carlo`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -364,7 +365,7 @@ export default function App() {
     }
 
     try {
-      const res = await fetch('/api/benchmark', {
+      const res = await fetch(`${API_BASE_URL}/api/benchmark`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
