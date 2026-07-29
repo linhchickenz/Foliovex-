@@ -57,9 +57,14 @@ def _portfolio_point(w: np.ndarray, mean_m: np.ndarray, cov_m: np.ndarray,
     }
 
 
-def _solve(objective, n: int, bounds, constraints, warm_starts=None):
+def _solve(objective, n: int, bounds, constraints, warm_starts=None, jac=None):
     """Multi-start SLSQP. Accepts the lowest-objective candidate that satisfies
-    the equality constraints, even if SLSQP reports success=False."""
+    the equality constraints, even if SLSQP reports success=False.
+
+    `jac`, when supplied, is the analytical gradient of `objective`. Passing it
+    lets SLSQP skip the 2-point finite-difference approximation, which otherwise
+    costs n extra objective evaluations per gradient — the dominant CPU cost on
+    Render's free tier for portfolios with several assets."""
     candidates = []
     if warm_starts:
         for w in warm_starts:
@@ -76,7 +81,7 @@ def _solve(objective, n: int, bounds, constraints, warm_starts=None):
     for x0 in candidates:
         try:
             res = minimize(
-                objective, x0, method="SLSQP",
+                objective, x0, method="SLSQP", jac=jac,
                 bounds=bounds, constraints=constraints,
                 options={"maxiter": 300, "ftol": 1e-10},
             )
@@ -107,7 +112,7 @@ def compute_frontier(mean_monthly: np.ndarray,
                      cov_monthly: np.ndarray,
                      rf_annual: float,
                      original_weights: np.ndarray,
-                     num_points: int = 60,
+                     num_points: int = 30,
                      short_selling: bool = False) -> dict:
     mean_m = np.asarray(mean_monthly, dtype=float)
     cov_m = np.asarray(cov_monthly, dtype=float)
@@ -119,16 +124,30 @@ def compute_frontier(mean_monthly: np.ndarray,
         bounds = [(None, None) for _ in range(n)]
     else:
         bounds = [(0.0, 1.0) for _ in range(n)]
-    sum_to_one = {"type": "eq", "fun": lambda w: float(np.sum(w) - 1.0)}
+    ones_n = np.ones(n)
+    sum_to_one = {
+        "type": "eq",
+        "fun": lambda w: float(np.sum(w) - 1.0),
+        "jac": lambda w: ones_n,
+    }
 
+    # Objectives and their analytical gradients. variance is the quadratic form
+    # xᵀ·Cov·x whose gradient is 2·Cov·x; neg_return is linear with a constant
+    # gradient. Supplying these avoids scipy's finite-difference approximation.
     def variance(w):
         return float(w @ cov_m @ w)
+
+    def variance_jac(w):
+        return 2.0 * (cov_m @ w)
 
     def neg_return(w):
         return float(-(w @ mean_m))
 
+    def neg_return_jac(w):
+        return -mean_m
+
     # ── Min variance ─────────────────────────────────────────────
-    min_var_res = _solve(variance, n, bounds, [sum_to_one])
+    min_var_res = _solve(variance, n, bounds, [sum_to_one], jac=variance_jac)
     if min_var_res is None:
         raise RuntimeError("Min-variance optimization failed")
     min_var_w = min_var_res.x
@@ -160,9 +179,11 @@ def compute_frontier(mean_monthly: np.ndarray,
         for target in targets:
             cons = [
                 sum_to_one,
-                {"type": "eq", "fun": lambda w, t=target: float(w @ mean_m - t)},
+                {"type": "eq", "fun": lambda w, t=target: float(w @ mean_m - t),
+                 "jac": lambda w: mean_m},
             ]
-            res = _solve(variance, n, bounds, cons, warm_starts=[prev_w])
+            res = _solve(variance, n, bounds, cons, warm_starts=[prev_w],
+                         jac=variance_jac)
             if res is None:
                 continue
             prev_w = res.x
@@ -203,8 +224,26 @@ def compute_frontier(mean_monthly: np.ndarray,
         ann_r = _annualize_ret(float(w @ mean_m))
         return -(ann_r - rf_annual) / ann_v
 
+    def neg_sharpe_jac(w):
+        # neg_sharpe(w) = -(annR - rf) / annV, a ratio f/g. By the quotient rule
+        # its gradient is -(f'·g - f·g')/g² with, in monthly terms:
+        #   annR = (1+rₘ)^A − 1     → f' = A·(1+rₘ)^(A−1)·mean_m
+        #   annV = √A·√(wᵀ·Cov·w)   → g' = √A·(Cov·w)/√(wᵀ·Cov·w)
+        r_m = float(w @ mean_m)
+        var_w = max(float(w @ cov_m @ w), 1e-18)
+        vol_w = np.sqrt(var_w)
+        ann_v = _annualize_vol(vol_w)
+        if ann_v <= 0:
+            return np.zeros(n)
+        num = _annualize_ret(r_m) - rf_annual          # f
+        d_num = ANN_FACTOR * (1.0 + r_m) ** (ANN_FACTOR - 1) * mean_m   # f'
+        d_ann_v = np.sqrt(ANN_FACTOR) * (cov_m @ w) / vol_w            # g'
+        grad_sharpe = (d_num * ann_v - num * d_ann_v) / (ann_v ** 2)
+        return -grad_sharpe
+
     refined = _solve(neg_sharpe, n, bounds, [sum_to_one],
-                     warm_starts=[best_sharpe_w, min_var_w, max_ret_w])
+                     warm_starts=[best_sharpe_w, min_var_w, max_ret_w],
+                     jac=neg_sharpe_jac)
     if refined is not None:
         sh_refined = _sharpe_of(refined.x, mean_m, cov_m, rf_annual)
         sh_seed = _sharpe_of(best_sharpe_w, mean_m, cov_m, rf_annual)
@@ -311,15 +350,19 @@ def _frontier_at_return(target_ret, mean_m, cov_m, rf_annual,
     def variance(w):
         return float(w @ cov_m @ w)
 
+    def variance_jac(w):
+        return 2.0 * (cov_m @ w)
+
     cons = [
         sum_to_one,
-        {"type": "eq", "fun": lambda w: float(w @ mean_m - target_ret)},
+        {"type": "eq", "fun": lambda w: float(w @ mean_m - target_ret),
+         "jac": lambda w: mean_m},
     ]
 
     closest = min(curve_pairs,
                   key=lambda pair: abs(pair[1]["expected_monthly_return"] - target_ret))
     res = _solve(variance, n, bounds, cons,
-                 warm_starts=[closest[0], min_var_w])
+                 warm_starts=[closest[0], min_var_w], jac=variance_jac)
     if res is not None:
         return _portfolio_point(res.x, mean_m, cov_m, rf_annual)
     return closest[1]
@@ -347,9 +390,13 @@ def _frontier_at_risk(target_var, mean_m, cov_m, rf_annual,
     def neg_return(w):
         return float(-(w @ mean_m))
 
+    def neg_return_jac(w):
+        return -mean_m
+
     cons = [
         sum_to_one,
-        {"type": "eq", "fun": lambda w: float(w @ cov_m @ w - target_var)},
+        {"type": "eq", "fun": lambda w: float(w @ cov_m @ w - target_var),
+         "jac": lambda w: 2.0 * (cov_m @ w)},
     ]
 
     def var_of_pair(pair):
@@ -357,7 +404,7 @@ def _frontier_at_risk(target_var, mean_m, cov_m, rf_annual,
 
     closest = min(curve_pairs, key=lambda pair: abs(var_of_pair(pair) - target_var))
     res = _solve(neg_return, n, bounds, cons,
-                 warm_starts=[closest[0], max_ret_w])
+                 warm_starts=[closest[0], max_ret_w], jac=neg_return_jac)
     if res is not None:
         return _portfolio_point(res.x, mean_m, cov_m, rf_annual)
     return closest[1]
